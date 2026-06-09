@@ -94,10 +94,18 @@ function checkIfBot(request: Request) {
 }
 
 function getClientIp(request: Request, connInfo: any) {
-    return request.headers.get('x-forwarded-for')?.split(',')[0] || 
-           request.headers.get('cf-connecting-ip') || 
-           request.headers.get('x-real-ip') || 
-           connInfo?.remoteAddr?.hostname || 'Unknown';
+    let ip = request.headers.get('x-forwarded-for')?.split(',')[0] || 
+             request.headers.get('cf-connecting-ip') || 
+             request.headers.get('x-real-ip') || 
+             connInfo?.remoteAddr?.hostname || 'Unknown';
+             
+    // This silently removes the "::ffff:" from modern IPv6 servers
+    // so your dashboard looks clean!
+    if (ip.startsWith("::ffff:")) {
+        ip = ip.replace("::ffff:", "");
+    }
+    
+    return ip;
 }
 
 function checkAuth(request: Request) {
