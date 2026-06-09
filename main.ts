@@ -10,18 +10,32 @@ const ADMIN_PASSWORD = "TAZAsara";
 const BOT_KEYWORDS = ['bot', 'spider', 'crawler', 'proxy', 'mimecast', 'barracuda', 'proofpoint', 'headless', 'inspect', 'python', 'curl', 'wget', 'httpclient'];
 
 // ============================================================================
-// 📦 DENO KV INITIALIZATION
+// 📦 DENO KV INITIALIZATION & COUNTER LOGIC (UPDATED)
 // ============================================================================
 const kv = await Deno.openKv();
 
-// Helper to increment global statistics
-async function incrementStat(key: string, amount: bigint = 1n) {
-    await kv.atomic().sum(["stats", key], new Deno.KvU64(amount)).commit();
+// Completely avoids the Deno.KvU64 "bigint" bug by using standard numbers
+// and an optimistic concurrency loop (Check-and-Set)
+async function incrementStat(key: string) {
+    let retries = 0;
+    while (retries < 10) {
+        const res = await kv.get(["stats", key]);
+        // Safely extract the number, even if it was previously saved as a KvU64 object
+        const current = res.value ? Number((res.value as any).value ?? res.value) : 0;
+        const commit = await kv.atomic()
+            .check(res)
+            .set(["stats", key], current + 1)
+            .commit();
+        
+        if (commit.ok) return; // Success!
+        retries++; // If there was a database collision, try again
+    }
 }
 
 async function getStat(key: string): Promise<number> {
     const res = await kv.get(["stats", key]);
-    return res.value ? Number((res.value as Deno.KvU64).value) : 0;
+    if (!res.value) return 0;
+    return Number((res.value as any).value ?? res.value);
 }
 
 // ============================================================================
@@ -214,7 +228,6 @@ async function handleCountAndRedirectRequest(request: Request, connInfo: any, sh
             ip: getClientIp(request, connInfo), isp: 'Unknown', created_at: new Date().toISOString()
         };
 
-        // Update counts and save
         record.click_count += 1;
         await kv.set(["urls", shortCode], record);
         await kv.set(["clicks", Date.now(), crypto.randomUUID()], clickRecord);
@@ -242,7 +255,6 @@ async function handleGetLogs(request: Request, corsHeaders: any) {
 async function handleDeleteLogs(request: Request, corsHeaders: any) {
     if (request.headers.get('x-tracking-secret') !== 'eygirl-secret-key-2026') return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 403, headers: corsHeaders });
     
-    // KV requires deleting keys one by one if not using batching, this runs in background
     const prefixes = ["opens", "clicks", "unsubscribes", "stats"];
     for (const prefix of prefixes) {
         for await (const entry of kv.list({ prefix: [prefix] })) { await kv.delete(entry.key); }
@@ -308,13 +320,12 @@ async function handleMainPageRequest(request: Request) {
         const totalBotClicks = await getStat("total_bot_clicks");
         const totalUnsubscribes = await getStat("total_unsubscribes");
 
-        // Fetch Data Arrays (Limit 2500 for memory efficiency on Dashboard)
+        // Fetch Data Arrays
         const recentLinks = []; for await (const entry of kv.list({ prefix: ["urls"] })) recentLinks.push(entry.value);
         const openers = []; for await (const entry of kv.list({ prefix: ["opens"] }, { reverse: true, limit: 2500 })) openers.push(entry.value);
         const rawClicks = []; for await (const entry of kv.list({ prefix: ["clicks"] }, { reverse: true, limit: 2500 })) rawClicks.push(entry.value);
         const rawUnsubscribes = []; for await (const entry of kv.list({ prefix: ["unsubscribes"] }, { reverse: true, limit: 1000 })) rawUnsubscribes.push(entry.value);
 
-        // Process Unique Maps
         const uniqueClickSet = new Set();
         const clicksMap: any = {}; 
         const clickCountriesMap: any = {};
@@ -357,7 +368,6 @@ async function handleMainPageRequest(request: Request) {
             return { date: u.created_at, email: u.email, profile: u.profileName || 'Unknown', country: u.country || 'Unknown', ip: u.ip || '-', isp: u.isp || '-', isBot: u.is_bot == 1 || u.is_bot === true, bot_reason: label, raw_ua: ua, raw_asn: asn };
         });
 
-        // Unique Grouping for Dashboard Tables
         const groupedOpensMap = new Map(); rawOpensSafe.forEach((op: any) => { const key = (op.email && op.email !== 'Anonymous') ? op.email.trim().toLowerCase() : `Anon-${op.date}`; if (!groupedOpensMap.has(key)) { groupedOpensMap.set(key, op); } });
         const uniqueGroupedOpens = Array.from(groupedOpensMap.values());
 
@@ -395,7 +405,6 @@ async function handleAnalyticsPageRequest(request: Request, shortCode: string) {
         if (!linkDataReq.value) return new Response('Link not found.', { status: 404 });
         const linkData: any = linkDataReq.value;
 
-        // Fetch clicks for this specific shortcode
         const rawClicksSafe: any[] = []; 
         for await (const entry of kv.list({ prefix: ["clicks"] }, { reverse: true })) {
             const c: any = entry.value;
@@ -405,7 +414,7 @@ async function handleAnalyticsPageRequest(request: Request, shortCode: string) {
             try { if (c.bot_reason && c.bot_reason.startsWith('{')) { const parsed = JSON.parse(c.bot_reason); label = parsed.label; ua = parsed.ua; asn = parsed.asn; } } catch(e) {}
             rawClicksSafe.push({ date: c.created_at, email: c.email || 'Anonymous', country: c.country || 'Unknown', os: c.os || 'Unknown', browser: c.browser || 'Unknown', isBot: c.is_bot == 1 || c.is_bot === true, ip: c.ip || '-', isp: c.isp || '-', bot_reason: label, raw_ua: ua, raw_asn: asn });
             
-            if (rawClicksSafe.length >= 1000) break; // Limit analytics page memory
+            if (rawClicksSafe.length >= 1000) break; 
         }
 
         const getUIBadgeInline = (label: string, rawUA: string, rawASN: string) => {
