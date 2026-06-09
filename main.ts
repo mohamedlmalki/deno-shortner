@@ -1,4 +1,4 @@
-// --- UNIFIED MARKETING ENGINE: PURE DENO KV EDITION ---
+// --- UNIFIED MARKETING ENGINE: PURE DENO KV EDITION (WITH FREE GEOLOCATION) ---
 
 // 🔒 1. SECURITY SETTINGS
 const SECRET_DASHBOARD_PATH = '/dashboard-FDff77'; 
@@ -10,25 +10,22 @@ const ADMIN_PASSWORD = "TAZAsara";
 const BOT_KEYWORDS = ['bot', 'spider', 'crawler', 'proxy', 'mimecast', 'barracuda', 'proofpoint', 'headless', 'inspect', 'python', 'curl', 'wget', 'httpclient'];
 
 // ============================================================================
-// 📦 DENO KV INITIALIZATION & COUNTER LOGIC (UPDATED)
+// 📦 DENO KV INITIALIZATION & COUNTER LOGIC
 // ============================================================================
 const kv = await Deno.openKv();
 
-// Completely avoids the Deno.KvU64 "bigint" bug by using standard numbers
-// and an optimistic concurrency loop (Check-and-Set)
 async function incrementStat(key: string) {
     let retries = 0;
     while (retries < 10) {
         const res = await kv.get(["stats", key]);
-        // Safely extract the number, even if it was previously saved as a KvU64 object
         const current = res.value ? Number((res.value as any).value ?? res.value) : 0;
         const commit = await kv.atomic()
             .check(res)
             .set(["stats", key], current + 1)
             .commit();
         
-        if (commit.ok) return; // Success!
-        retries++; // If there was a database collision, try again
+        if (commit.ok) return; 
+        retries++; 
     }
 }
 
@@ -39,7 +36,34 @@ async function getStat(key: string): Promise<number> {
 }
 
 // ============================================================================
-// 📱 1. APP CLIENT DETECTOR
+// 🌍 3. FREE IP GEOLOCATION API (NO ACCOUNT NEEDED)
+// ============================================================================
+async function getGeoData(request: Request, ip: string) {
+    // If you ever use Cloudflare in the future, this catches it instantly for free
+    const cfCountry = request.headers.get('cf-ipcountry');
+    
+    // Skip local testing IPs
+    if (!ip || ip === "Unknown" || ip.includes("127.0.0.1") || ip.includes("localhost")) {
+        return { country: cfCountry || "Unknown", isp: "Unknown" };
+    }
+    
+    try {
+        // Pings ip-api.com (Free, no keys needed, up to 45 requests per minute)
+        const res = await fetch(`http://ip-api.com/json/${ip}`);
+        if (!res.ok) return { country: cfCountry || "Unknown", isp: "Unknown" };
+        
+        const data = await res.json();
+        return { 
+            country: data.country || cfCountry || "Unknown",
+            isp: data.isp || "Unknown" 
+        };
+    } catch (e) {
+        return { country: cfCountry || "Unknown", isp: "Unknown" };
+    }
+}
+
+// ============================================================================
+// 📱 4. APP CLIENT DETECTOR
 // ============================================================================
 function getClientApp(request: Request) {
     const ua = request.headers.get('User-Agent') || '';
@@ -62,9 +86,6 @@ function getClientApp(request: Request) {
     return "🌐 Unknown Browser/App";
 }
 
-// ============================================================================
-// 🤖 2. BOT STATUS DETECTOR
-// ============================================================================
 function checkIfBot(request: Request) {
     const ua = (request.headers.get('User-Agent') || '').toLowerCase();
     if (ua.includes('googleimageproxy') || ua.includes('yahoomailproxy') || ua.includes('webkit_version')) return 0; 
@@ -72,16 +93,11 @@ function checkIfBot(request: Request) {
     return 0; 
 }
 
-// --- HELPERS ---
 function getClientIp(request: Request, connInfo: any) {
     return request.headers.get('x-forwarded-for')?.split(',')[0] || 
            request.headers.get('cf-connecting-ip') || 
            request.headers.get('x-real-ip') || 
            connInfo?.remoteAddr?.hostname || 'Unknown';
-}
-
-function getClientCountry(request: Request) {
-    return request.headers.get('cf-ipcountry') || 'Unknown';
 }
 
 function checkAuth(request: Request) {
@@ -157,9 +173,15 @@ async function handleUnsubscribe(request: Request, connInfo: any) {
     const isBot = checkIfBot(request);
     const botReasonPayload = JSON.stringify({ label: clientApp, ua: request.headers.get('User-Agent') || 'None', asn: 'Unknown' });
     
+    // Get IP and Location
+    const ip = getClientIp(request, connInfo);
+    const geo = await getGeoData(request, ip);
+    
     const record = {
-        email, profileName, country: getClientCountry(request),
-        ip: getClientIp(request, connInfo), isp: 'Unknown', is_bot: isBot,
+        email, profileName, 
+        country: geo.country,
+        ip: ip, isp: geo.isp, 
+        is_bot: isBot,
         bot_reason: botReasonPayload, created_at: new Date().toISOString()
     };
 
@@ -184,11 +206,17 @@ async function handleTrackingPixel(request: Request, connInfo: any) {
     }   
     
     if (email) {
+        // Get IP and Location
+        const ip = getClientIp(request, connInfo);
+        const geo = await getGeoData(request, ip);
+        
         const record = {
-            email, ticketId, country: getClientCountry(request), profileName,
+            email, ticketId, profileName,
+            country: geo.country,
+            ip: ip, isp: geo.isp,
             is_bot: checkIfBot(request), 
             bot_reason: JSON.stringify({ label: getClientApp(request), ua: request.headers.get('User-Agent') || 'None', asn: 'Unknown' }),
-            ip: getClientIp(request, connInfo), isp: 'Unknown', openedAt: new Date().toISOString()
+            openedAt: new Date().toISOString()
         };
         await kv.set(["opens", Date.now(), crypto.randomUUID()], record);
         await incrementStat("total_opens");
@@ -220,12 +248,17 @@ async function handleCountAndRedirectRequest(request: Request, connInfo: any, sh
         }
         
         const isBot = checkIfBot(request);
+        
+        // Get IP and Location
+        const ip = getClientIp(request, connInfo);
+        const geo = await getGeoData(request, ip);
+        
         const clickRecord = {
             url_id: shortCode, short_code: shortCode, email: emailParam,
-            country: getClientCountry(request), os: 'Unknown', browser: getClientApp(request),
+            country: geo.country, os: 'Unknown', browser: getClientApp(request),
             is_bot: isBot,
-            bot_reason: JSON.stringify({ label: getClientApp(request), ua: request.headers.get('User-Agent') || 'None', asn: 'Unknown' }),
-            ip: getClientIp(request, connInfo), isp: 'Unknown', created_at: new Date().toISOString()
+            bot_reason: JSON.stringify({ label: getClientApp(request), ua: request.headers.get('User-Agent') || 'None', asn: geo.isp }),
+            ip: ip, isp: geo.isp, created_at: new Date().toISOString()
         };
 
         record.click_count += 1;
@@ -312,7 +345,6 @@ async function handleMainPageRequest(request: Request) {
     try { 
         const origin = new URL(request.url).origin; 
 
-        // Fetch Global Stats
         const totalLinks = await getStat("total_links");
         const totalClicks = await getStat("total_clicks");
         const totalOpens = await getStat("total_opens");
@@ -320,7 +352,6 @@ async function handleMainPageRequest(request: Request) {
         const totalBotClicks = await getStat("total_bot_clicks");
         const totalUnsubscribes = await getStat("total_unsubscribes");
 
-        // Fetch Data Arrays
         const recentLinks = []; for await (const entry of kv.list({ prefix: ["urls"] })) recentLinks.push(entry.value);
         const openers = []; for await (const entry of kv.list({ prefix: ["opens"] }, { reverse: true, limit: 2500 })) openers.push(entry.value);
         const rawClicks = []; for await (const entry of kv.list({ prefix: ["clicks"] }, { reverse: true, limit: 2500 })) rawClicks.push(entry.value);
@@ -442,7 +473,7 @@ async function handleAnalyticsPageRequest(request: Request, shortCode: string) {
     } catch (error) { return new Response('Error loading analytics: ' + String(error), { status: 500 }); }
 }
 
-// --- HTML TEMPLATES MAIN DASHBOARD (Same Visual UI) ---
+// --- HTML TEMPLATES MAIN DASHBOARD ---
 function generateUnifiedDashboardHtml(links: any, groupedOpeners: any, smartGlobalEvents: any, groupedAllClicks: any, rawOpensSafe: any, rawClicksSafe: any, rawUnsubsSafe: any, clicksMap: any, opensMap: any, clickCountriesMap: any, origin: any, totalLinks: any, totalClicks: any, uniqueClicks: any, totalOpens: any, totalBotOpens: any, uniqueBotOpens: any, totalBotClicks: any, uniqueBotClicks: any, trueUniqueUsers: any, totalUnsubscribes: any) { 
     const getUIBadge = (label: string, rawUA: string, rawASN: string) => {
         let style = "";
