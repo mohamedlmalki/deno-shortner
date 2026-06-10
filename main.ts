@@ -1,4 +1,4 @@
-// --- UNIFIED MARKETING ENGINE: STABILIZED EDITION ---
+// --- UNIFIED MARKETING ENGINE: STABILIZED EDITION (TIMEOUT-PROOF) ---
 
 // 🔒 1. SECURITY SETTINGS
 const SECRET_DASHBOARD_PATH = '/dashboard-FDff77'; 
@@ -36,7 +36,8 @@ async function getStat(key: string): Promise<number> {
     return Number((res.value as any).value ?? res.value);
 }
 
-async function fetchKvList(prefix: string[], limit: number = 500, reverse: boolean = true) {
+// Safer database fetching method to prevent CPU stalling
+async function fetchKvList(prefix: string[], limit: number = 100, reverse: boolean = true) {
     const results = [];
     for await (const entry of kv.list({ prefix }, { reverse, limit })) {
         results.push(entry.value);
@@ -137,7 +138,7 @@ Deno.serve(async (request: Request, connInfo: any) => {
     const corsHeaders = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "*", "Access-Control-Allow-Headers": "*" };
     if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
-    // --- FIX: Redirect Root Domain to Dashboard Automatically ---
+    // Redirect Root Domain to Dashboard Automatically
     if (path === '/' || path === '') {
         return Response.redirect(`${url.origin}${SECRET_DASHBOARD_PATH}`, 302);
     }
@@ -268,7 +269,7 @@ async function handleCountAndRedirectRequest(request: Request, connInfo: any, sh
 
 // --- API FUNCTIONS ---
 async function handleGetLogs(request: Request, corsHeaders: any) {
-    const logs = await fetchKvList(["opens"], 500, true);
+    const logs = await fetchKvList(["opens"], 200, true);
     return new Response(JSON.stringify({ success: true, logs }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
 }
 
@@ -313,7 +314,7 @@ async function handleDeleteRequest(shortCode: string) {
 }
 
 // ============================================================================
-// 📊 UI HTML & DATA BUILDER (SAFELY ESCAPED)
+// 📊 UI HTML & DATA BUILDER (SAFELY ESCAPED & TIMEOUT PROOF)
 // ============================================================================
 
 function createSafeBadge(label: string, rawUA: string, rawASN: string) {
@@ -325,30 +326,31 @@ function createSafeBadge(label: string, rawUA: string, rawASN: string) {
     
     const safeUA = (rawUA || 'Unknown').replace(/"/g, "&quot;");
     const safeLabel = (label || 'Unknown').replace(/"/g, "&quot;");
-    // Securely injecting data via data-* attributes prevents browser crashing
     return `<span style="${style}" onclick="showRawData(this)" data-label="${safeLabel}" data-ua="${safeUA}" data-asn="${rawASN}" title="View Raw Data">${label}</span>`;
 }
 
 async function handleMainPageRequest(request: Request) { 
     try { 
         const origin = new URL(request.url).origin; 
-        const [totalLinks, totalClicks, totalOpens, totalBotOpens, totalBotClicks, totalUnsubscribes] = await Promise.all([
-            getStat("total_links"), getStat("total_clicks"), getStat("total_opens"), 
-            getStat("total_bot_opens"), getStat("total_bot_clicks"), getStat("total_unsubscribes")
-        ]);
+        
+        // Fetch sequentially to avoid jamming the free-tier KV connection pool
+        const totalLinks = await getStat("total_links");
+        const totalClicks = await getStat("total_clicks");
+        const totalOpens = await getStat("total_opens");
+        const totalUnsubscribes = await getStat("total_unsubscribes");
 
-        const [recentLinks, openers, rawClicks, rawUnsubscribes] = await Promise.all([
-            fetchKvList(["urls"], 500, false), fetchKvList(["opens"], 500, true),
-            fetchKvList(["clicks"], 500, true), fetchKvList(["unsubscribes"], 500, true)
-        ]);
+        // Reduced list sizes from 500 to 100 to prevent HTML string generation from timing out
+        const recentLinks = await fetchKvList(["urls"], 100, false);
+        const openers = await fetchKvList(["opens"], 100, true);
+        const rawClicks = await fetchKvList(["clicks"], 100, true);
 
-        const clicksMap: any = {}; const opensMap: any = {}; const clickCountriesMap: any = {};
+        const clicksMap: any = {}; const opensMap: any = {};
         const uniqueClickSet = new Set();
         
         rawClicks.forEach((c: any) => { 
             if (c.email && c.email !== 'Anonymous') {
                 const e = c.email.trim().toLowerCase(); uniqueClickSet.add(e);
-                clicksMap[e] = (clicksMap[e] || 0) + 1; clickCountriesMap[e] = clickCountriesMap[e] || c.country;
+                clicksMap[e] = (clicksMap[e] || 0) + 1;
             }
         });
         openers.forEach((o: any) => { 
@@ -370,7 +372,6 @@ async function handleMainPageRequest(request: Request) {
             return { date: c.created_at, email: c.email || 'Anonymous', short_code: c.short_code, country: c.country || '-', ip: c.ip || '-', isp: c.isp || '-', isBot: !!c.is_bot, bot_reason: label, raw_ua: ua, raw_asn: asn };
         });
 
-        // Building Safe HTML Rows
         const linksHtml = recentLinks.length ? recentLinks.map((link:any) => `
             <div class="link-card">
                 <div><p class="short-url">${origin}/${link.short_code}</p><p class="long-url">${link.long_url}</p><p class="stats">Clicks: ${link.click_count || 0}</p></div>
@@ -404,7 +405,6 @@ async function handleMainPageRequest(request: Request) {
                 <td style="text-align:center;">${createSafeBadge(c.bot_reason, c.raw_ua, c.raw_asn)}</td>
             </tr>`).join('') : '<tr><td colspan="8" style="text-align:center;">No clicks yet.</td></tr>';
 
-        // Escaping JSON for safe browser script injection
         const safeOpensJSON = JSON.stringify(rawOpensSafe).replace(/</g, '\\u003c');
         const safeClicksJSON = JSON.stringify(rawClicksSafe).replace(/</g, '\\u003c');
 
@@ -467,7 +467,7 @@ async function handleMainPageRequest(request: Request) {
                         <button class="close-btn" onclick="closeTableModal()">Close Data</button>
                     </div>
                     <div style="background:#e0f2fe; color:#0369a1; padding:10px; text-align:center; border-radius:6px; margin-bottom:10px; font-weight:bold;">
-                        Displaying up to the 500 newest events.
+                        Displaying up to the 100 newest events.
                     </div>
                     
                     <div id="opens-section" style="display:none; max-height: 650px; overflow-y: auto;">
@@ -508,7 +508,6 @@ async function handleMainPageRequest(request: Request) {
             </div>
 
             <script>
-                // Safely injected JSON data
                 const rawOpensData = ${safeOpensJSON};
                 const rawClicksData = ${safeClicksJSON};
 
@@ -523,7 +522,6 @@ async function handleMainPageRequest(request: Request) {
                     document.getElementById('table-modal').style.display = 'none'; 
                 } 
 
-                // Safely extract data from the HTML attributes to prevent browser crashes
                 function showRawData(element) { 
                     if (event) event.stopPropagation(); 
                     const label = element.getAttribute('data-label') || 'Unknown';
@@ -626,15 +624,13 @@ async function handleAnalyticsPageRequest(request: Request, shortCode: string) {
         const linkData: any = linkDataReq.value;
 
         const rawClicksSafe: any[] = []; 
-        for await (const entry of kv.list({ prefix: ["clicks"] }, { reverse: true })) {
+        for await (const entry of kv.list({ prefix: ["clicks"] }, { reverse: true, limit: 200 })) {
             const c: any = entry.value;
             if (c.short_code !== shortCode) continue;
             
             let label = c.bot_reason || '🌐 Web Browser'; let ua = 'Unknown'; let asn = 'Unknown';
             try { if (c.bot_reason && c.bot_reason.startsWith('{')) { const parsed = JSON.parse(c.bot_reason); label = parsed.label; ua = parsed.ua; asn = parsed.asn; } } catch(e) {}
             rawClicksSafe.push({ date: c.created_at, email: c.email || 'Anonymous', country: c.country || 'Unknown', os: c.os || 'Unknown', browser: c.browser || 'Unknown', isBot: c.is_bot == 1 || c.is_bot === true, ip: c.ip || '-', isp: c.isp || '-', bot_reason: label, raw_ua: ua, raw_asn: asn });
-            
-            if (rawClicksSafe.length >= 500) break; 
         }
 
         const clicksHtmlRows = rawClicksSafe.map((c, i) => `
