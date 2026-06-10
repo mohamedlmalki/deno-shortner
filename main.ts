@@ -1,4 +1,4 @@
-// --- UNIFIED MARKETING ENGINE: PURE DENO KV EDITION (WITH FREE GEOLOCATION) ---
+// --- UNIFIED MARKETING ENGINE: PURE DENO KV EDITION (HIGH PERFORMANCE) ---
 
 // 🔒 1. SECURITY SETTINGS
 const SECRET_DASHBOARD_PATH = '/dashboard-FDff77'; 
@@ -26,6 +26,8 @@ async function incrementStat(key: string) {
         
         if (commit.ok) return; 
         retries++; 
+        // Add tiny exponential backoff to prevent CPU locking under high traffic
+        await new Promise(r => setTimeout(r, 10 * retries)); 
     }
 }
 
@@ -35,20 +37,26 @@ async function getStat(key: string): Promise<number> {
     return Number((res.value as any).value ?? res.value);
 }
 
+// Helper to fetch KV lists lightning fast
+async function fetchKvList(prefix: string[], limit: number = 500, reverse: boolean = true) {
+    const results = [];
+    for await (const entry of kv.list({ prefix }, { reverse, limit })) {
+        results.push(entry.value);
+    }
+    return results;
+}
+
 // ============================================================================
 // 🌍 3. FREE IP GEOLOCATION API (NO ACCOUNT NEEDED)
 // ============================================================================
 async function getGeoData(request: Request, ip: string) {
-    // If you ever use Cloudflare in the future, this catches it instantly for free
     const cfCountry = request.headers.get('cf-ipcountry');
     
-    // Skip local testing IPs
     if (!ip || ip === "Unknown" || ip.includes("127.0.0.1") || ip.includes("localhost")) {
         return { country: cfCountry || "Unknown", isp: "Unknown" };
     }
     
     try {
-        // Pings ip-api.com (Free, no keys needed, up to 45 requests per minute)
         const res = await fetch(`http://ip-api.com/json/${ip}`);
         if (!res.ok) return { country: cfCountry || "Unknown", isp: "Unknown" };
         
@@ -99,12 +107,7 @@ function getClientIp(request: Request, connInfo: any) {
              request.headers.get('x-real-ip') || 
              connInfo?.remoteAddr?.hostname || 'Unknown';
              
-    // This silently removes the "::ffff:" from modern IPv6 servers
-    // so your dashboard looks clean!
-    if (ip.startsWith("::ffff:")) {
-        ip = ip.replace("::ffff:", "");
-    }
-    
+    if (ip.startsWith("::ffff:")) ip = ip.replace("::ffff:", "");
     return ip;
 }
 
@@ -179,9 +182,7 @@ async function handleUnsubscribe(request: Request, connInfo: any) {
 
     const clientApp = getClientApp(request);
     const isBot = checkIfBot(request);
-    const botReasonPayload = JSON.stringify({ label: clientApp, ua: request.headers.get('User-Agent') || 'None', asn: 'Unknown' });
     
-    // Get IP and Location
     const ip = getClientIp(request, connInfo);
     const geo = await getGeoData(request, ip);
     
@@ -190,7 +191,8 @@ async function handleUnsubscribe(request: Request, connInfo: any) {
         country: geo.country,
         ip: ip, isp: geo.isp, 
         is_bot: isBot,
-        bot_reason: botReasonPayload, created_at: new Date().toISOString()
+        bot_reason: JSON.stringify({ label: clientApp, ua: request.headers.get('User-Agent') || 'None', asn: geo.isp }), 
+        created_at: new Date().toISOString()
     };
 
     await kv.set(["unsubscribes", Date.now(), crypto.randomUUID()], record);
@@ -214,7 +216,6 @@ async function handleTrackingPixel(request: Request, connInfo: any) {
     }   
     
     if (email) {
-        // Get IP and Location
         const ip = getClientIp(request, connInfo);
         const geo = await getGeoData(request, ip);
         
@@ -223,7 +224,7 @@ async function handleTrackingPixel(request: Request, connInfo: any) {
             country: geo.country,
             ip: ip, isp: geo.isp,
             is_bot: checkIfBot(request), 
-            bot_reason: JSON.stringify({ label: getClientApp(request), ua: request.headers.get('User-Agent') || 'None', asn: 'Unknown' }),
+            bot_reason: JSON.stringify({ label: getClientApp(request), ua: request.headers.get('User-Agent') || 'None', asn: geo.isp }),
             openedAt: new Date().toISOString()
         };
         await kv.set(["opens", Date.now(), crypto.randomUUID()], record);
@@ -257,7 +258,6 @@ async function handleCountAndRedirectRequest(request: Request, connInfo: any, sh
         
         const isBot = checkIfBot(request);
         
-        // Get IP and Location
         const ip = getClientIp(request, connInfo);
         const geo = await getGeoData(request, ip);
         
@@ -286,11 +286,9 @@ async function handleCountAndRedirectRequest(request: Request, connInfo: any, sh
 
 // --- API & SYSTEM FUNCTIONS ---
 async function handleGetLogs(request: Request, corsHeaders: any) {
-    const logs = [];
-    for await (const entry of kv.list({ prefix: ["opens"] }, { reverse: true, limit: 1000 })) {
-        logs.push({ ...entry.value as any, hasClicked: false, clickCount: 0, clickCountry: null });
-    }
-    return new Response(JSON.stringify({ success: true, logs }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    const logs = await fetchKvList(["opens"], 500, true);
+    const mappedLogs = logs.map((l: any) => ({ ...l, hasClicked: false, clickCount: 0, clickCountry: null }));
+    return new Response(JSON.stringify({ success: true, logs: mappedLogs }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
 }
 
 async function handleDeleteLogs(request: Request, corsHeaders: any) {
@@ -347,23 +345,25 @@ function generateShortCode(length = 7) {
 }
 
 // ============================================================================
-// 📊 DASHBOARD & ANALYTICS RENDERING
+// 📊 DASHBOARD & ANALYTICS RENDERING (HIGH SPEED VERSION)
 // ============================================================================
 async function handleMainPageRequest(request: Request) { 
     try { 
         const origin = new URL(request.url).origin; 
 
-        const totalLinks = await getStat("total_links");
-        const totalClicks = await getStat("total_clicks");
-        const totalOpens = await getStat("total_opens");
-        const totalBotOpens = await getStat("total_bot_opens");
-        const totalBotClicks = await getStat("total_bot_clicks");
-        const totalUnsubscribes = await getStat("total_unsubscribes");
+        // FETCH ALL STATS IN PARALLEL
+        const [totalLinks, totalClicks, totalOpens, totalBotOpens, totalBotClicks, totalUnsubscribes] = await Promise.all([
+            getStat("total_links"), getStat("total_clicks"), getStat("total_opens"), 
+            getStat("total_bot_opens"), getStat("total_bot_clicks"), getStat("total_unsubscribes")
+        ]);
 
-        const recentLinks = []; for await (const entry of kv.list({ prefix: ["urls"] })) recentLinks.push(entry.value);
-        const openers = []; for await (const entry of kv.list({ prefix: ["opens"] }, { reverse: true, limit: 2500 })) openers.push(entry.value);
-        const rawClicks = []; for await (const entry of kv.list({ prefix: ["clicks"] }, { reverse: true, limit: 2500 })) rawClicks.push(entry.value);
-        const rawUnsubscribes = []; for await (const entry of kv.list({ prefix: ["unsubscribes"] }, { reverse: true, limit: 1000 })) rawUnsubscribes.push(entry.value);
+        // FETCH ALL DATA LISTS IN PARALLEL (Limited to 500 for lightning speed dashboard loading)
+        const [recentLinks, openers, rawClicks, rawUnsubscribes] = await Promise.all([
+            fetchKvList(["urls"], 500, false),
+            fetchKvList(["opens"], 500, true),
+            fetchKvList(["clicks"], 500, true),
+            fetchKvList(["unsubscribes"], 500, true)
+        ]);
 
         const uniqueClickSet = new Set();
         const clicksMap: any = {}; 
@@ -453,7 +453,7 @@ async function handleAnalyticsPageRequest(request: Request, shortCode: string) {
             try { if (c.bot_reason && c.bot_reason.startsWith('{')) { const parsed = JSON.parse(c.bot_reason); label = parsed.label; ua = parsed.ua; asn = parsed.asn; } } catch(e) {}
             rawClicksSafe.push({ date: c.created_at, email: c.email || 'Anonymous', country: c.country || 'Unknown', os: c.os || 'Unknown', browser: c.browser || 'Unknown', isBot: c.is_bot == 1 || c.is_bot === true, ip: c.ip || '-', isp: c.isp || '-', bot_reason: label, raw_ua: ua, raw_asn: asn });
             
-            if (rawClicksSafe.length >= 1000) break; 
+            if (rawClicksSafe.length >= 500) break; 
         }
 
         const getUIBadgeInline = (label: string, rawUA: string, rawASN: string) => {
